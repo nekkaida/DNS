@@ -1,350 +1,232 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <errno.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <sys/time.h> /* Add this for struct timeval */
+/*
+ * DNS Forwarding Server - Main Entry Point
+ * Copyright (c) 2025 Kenneth Riadi Nugroho
+ * Licensed under MIT License
+ *
+ * A lightweight, security-hardened DNS forwarding server.
+ *
+ * Features:
+ * - Response Rate Limiting (RRL) to prevent DNS amplification attacks
+ * - Cryptographically random query IDs
+ * - Response source validation
+ * - Bounds-checked packet parsing
+ * - Graceful shutdown handling
+ */
 
-// DNS header structure (packed to ensure proper alignment)
-typedef struct {
-    uint16_t id;       // ID field
-    uint16_t flags;    // DNS flags
-    uint16_t qdcount;  // Question count
-    uint16_t ancount;  // Answer count
-    uint16_t nscount;  // Authority count
-    uint16_t arcount;  // Additional count
-} __attribute__((packed)) dns_header_t;
+#include "include/server.h"
+#include "include/dns.h"
+#include "include/security.h"
 
-// Function to extract length of a domain name
-int get_name_length(const unsigned char *data) {
-    const unsigned char *ptr = data;
-    while (*ptr) {
-        if ((*ptr & 0xC0) == 0xC0) {
-            // Compressed name - 2 bytes
-            return (ptr - data) + 2;
+/* ============================================================================
+ * Global State
+ * ============================================================================ */
+
+static volatile sig_atomic_t g_running = 1;
+
+/* ============================================================================
+ * Signal Handling
+ * ============================================================================ */
+
+static void signal_handler(int signum) {
+    (void)signum;
+    g_running = 0;
+}
+
+static void setup_signal_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+}
+
+/* ============================================================================
+ * Command Line Parsing
+ * ============================================================================ */
+
+static void print_usage(const char *program) {
+    fprintf(stderr, "DNS Forwarding Server v%s (Security Hardened)\n",
+            DNS_SERVER_VERSION_STRING);
+    fprintf(stderr, "Copyright (c) 2025 Kenneth Riadi Nugroho\n\n");
+    fprintf(stderr, "Usage: %s --resolver <ip:port> [options]\n\n", program);
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  --resolver <ip:port>  Upstream DNS resolver (required)\n");
+    fprintf(stderr, "                        IPv6: [2001:4860:4860::8888]:53\n");
+    fprintf(stderr, "  --port <port>         Local listening port (default: %d)\n",
+            DEFAULT_LISTEN_PORT);
+    fprintf(stderr, "  --ipv6                Enable IPv6 listening\n");
+    fprintf(stderr, "  --verbose             Enable verbose logging\n");
+    fprintf(stderr, "  --help                Show this help message\n");
+    fprintf(stderr, "\nExamples:\n");
+    fprintf(stderr, "  %s --resolver 8.8.8.8:53\n", program);
+    fprintf(stderr, "  %s --resolver 1.1.1.1:53 --port 5353 --verbose\n", program);
+    fprintf(stderr, "  %s --resolver [2001:4860:4860::8888]:53 --ipv6\n", program);
+}
+
+static int parse_resolver(const char *resolver_str, server_config_t *config) {
+    /* Check for IPv6 address in brackets: [ipv6]:port */
+    if (resolver_str[0] == '[') {
+        const char *bracket_end = strchr(resolver_str, ']');
+        if (!bracket_end) {
+            LOG_ERROR("Invalid IPv6 address format (missing ])");
+            return -1;
         }
-        ptr += (*ptr + 1);
+
+        size_t ip_len = bracket_end - resolver_str - 1;
+        if (ip_len >= sizeof(config->resolver_ip)) {
+            LOG_ERROR("Resolver IP too long");
+            return -1;
+        }
+
+        strncpy(config->resolver_ip, resolver_str + 1, ip_len);
+        config->resolver_ip[ip_len] = '\0';
+
+        /* Check for port after bracket */
+        if (bracket_end[1] == ':') {
+            config->resolver_port = atoi(bracket_end + 2);
+            if (config->resolver_port <= 0 || config->resolver_port > 65535) {
+                LOG_ERROR("Invalid resolver port");
+                return -1;
+            }
+        } else if (bracket_end[1] == '\0') {
+            config->resolver_port = 53;
+        } else {
+            LOG_ERROR("Invalid format after IPv6 address");
+            return -1;
+        }
+
+        return 0;
     }
-    // Add one for null terminator
-    return (ptr - data) + 1;
+
+    /* IPv4 address or hostname: ip:port or just ip */
+    const char *colon = strrchr(resolver_str, ':');
+
+    if (colon) {
+        size_t ip_len = colon - resolver_str;
+        if (ip_len >= sizeof(config->resolver_ip)) {
+            LOG_ERROR("Resolver IP too long");
+            return -1;
+        }
+        strncpy(config->resolver_ip, resolver_str, ip_len);
+        config->resolver_ip[ip_len] = '\0';
+        config->resolver_port = atoi(colon + 1);
+
+        if (config->resolver_port <= 0 || config->resolver_port > 65535) {
+            LOG_ERROR("Invalid resolver port");
+            return -1;
+        }
+    } else {
+        if (strlen(resolver_str) >= sizeof(config->resolver_ip)) {
+            LOG_ERROR("Resolver IP too long");
+            return -1;
+        }
+        strncpy(config->resolver_ip, resolver_str, sizeof(config->resolver_ip) - 1);
+        config->resolver_ip[sizeof(config->resolver_ip) - 1] = '\0';
+        config->resolver_port = 53;  /* Default DNS port */
+    }
+
+    return 0;
 }
 
-// Function to build a DNS query with a single question
-void build_single_query(unsigned char *buffer, int query_id, const unsigned char *question, int question_len) {
-    // Set up header
-    dns_header_t *header = (dns_header_t *)buffer;
-    header->id = htons(query_id);
-    header->flags = htons(0x0100); // RD bit set
-    header->qdcount = htons(1);    // One question
-    header->ancount = htons(0);
-    header->nscount = htons(0);
-    header->arcount = htons(0);
-    
-    // Copy question
-    memcpy(buffer + sizeof(dns_header_t), question, question_len);
-}
+static int parse_args(int argc, char *argv[], server_config_t *config) {
+    /* Set defaults */
+    memset(config, 0, sizeof(server_config_t));
+    config->listen_port = DEFAULT_LISTEN_PORT;
+    config->resolver_port = 53;
+    config->verbose = false;
+    config->ipv4_enabled = true;   /* IPv4 enabled by default */
+    config->ipv6_enabled = false;  /* IPv6 opt-in */
 
-// Function to extract a question from a DNS packet
-unsigned char* extract_question(unsigned char *buffer, const unsigned char *data, int *question_len) {
-    int name_len = get_name_length(data);
-    
-    // Total length = name + 4 bytes (TYPE + CLASS)
-    *question_len = name_len + 4;
-    
-    // Copy the question
-    memcpy(buffer, data, *question_len);
-    
-    return buffer;
-}
+    bool have_resolver = false;
 
-// Function to make a standard DNS A record answer
-void create_a_record_answer(unsigned char *buffer, const unsigned char *name, int name_len, 
-                          const char *ip_addr, int *answer_len) {
-    unsigned char *ptr = buffer;
-    
-    // Copy the domain name
-    memcpy(ptr, name, name_len);
-    ptr += name_len;
-    
-    // Type: A (1)
-    *ptr++ = 0x00;
-    *ptr++ = 0x01;
-    
-    // Class: IN (1)
-    *ptr++ = 0x00;
-    *ptr++ = 0x01;
-    
-    // TTL: 60 seconds
-    *ptr++ = 0x00;
-    *ptr++ = 0x00;
-    *ptr++ = 0x00;
-    *ptr++ = 0x3C;
-    
-    // Data length: 4 bytes for IPv4
-    *ptr++ = 0x00;
-    *ptr++ = 0x04;
-    
-    // IP Address (hardcoded to 8.8.8.8)
-    in_addr_t addr = inet_addr(ip_addr);
-    memcpy(ptr, &addr, 4);
-    ptr += 4;
-    
-    *answer_len = ptr - buffer;
-}
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--resolver") == 0) {
+            if (i + 1 >= argc) {
+                LOG_ERROR("--resolver requires an argument");
+                return -1;
+            }
+            if (parse_resolver(argv[++i], config) < 0) {
+                return -1;
+            }
+            have_resolver = true;
+        } else if (strcmp(argv[i], "--port") == 0) {
+            if (i + 1 >= argc) {
+                LOG_ERROR("--port requires an argument");
+                return -1;
+            }
+            config->listen_port = atoi(argv[++i]);
+            if (config->listen_port <= 0 || config->listen_port > 65535) {
+                LOG_ERROR("Invalid listen port");
+                return -1;
+            }
+        } else if (strcmp(argv[i], "--ipv6") == 0) {
+            config->ipv6_enabled = true;
+        } else if (strcmp(argv[i], "--verbose") == 0) {
+            config->verbose = true;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            exit(0);
+        } else {
+            LOG_ERROR("Unknown option: %s", argv[i]);
+            print_usage(argv[0]);
+            return -1;
+        }
+    }
 
-// Function to forward a DNS query to the resolver
-int forward_query(int sock, const struct sockaddr_in *resolver, 
-                 const unsigned char *query, int query_len,
-                 unsigned char *response, int response_max_len) {
-    // Send query to resolver
-    if (sendto(sock, query, query_len, 0, 
-              (struct sockaddr*)resolver, sizeof(*resolver)) < 0) {
-        perror("sendto resolver failed");
+    if (!have_resolver) {
+        LOG_ERROR("--resolver is required");
+        print_usage(argv[0]);
         return -1;
     }
-    
-    // Receive response
-    struct sockaddr_in resp_addr;
-    socklen_t resp_len = sizeof(resp_addr);
-    
-    int recv_len = recvfrom(sock, response, response_max_len, 0,
-                           (struct sockaddr*)&resp_addr, &resp_len);
-    
-    if (recv_len < 0) {
-        perror("recvfrom resolver failed");
-        return -1;
-    }
-    
-    return recv_len;
+
+    return 0;
 }
 
-// Extract the answer section from a response
-void extract_answer(const unsigned char *response, int response_len, 
-                   unsigned char *answer_buffer, int *answer_len) {
-    // Skip header
-    const unsigned char *ptr = response + sizeof(dns_header_t);
-    
-    // Skip question
-    int name_len = get_name_length(ptr);
-    ptr += name_len + 4; // QTYPE and QCLASS
-    
-    // Calculate answer length
-    *answer_len = response_len - (ptr - response);
-    
-    // Copy the answer
-    memcpy(answer_buffer, ptr, *answer_len);
-}
+/* ============================================================================
+ * Main Entry Point
+ * ============================================================================ */
 
 int main(int argc, char *argv[]) {
-    // Disable buffering for stdout
+    /* Disable buffering for stdout */
     setbuf(stdout, NULL);
-    
-    // Check command line arguments
-    if (argc < 3 || strcmp(argv[1], "--resolver") != 0) {
-        fprintf(stderr, "Usage: %s --resolver <ip:port>\n", argv[0]);
+
+    /* Print banner */
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║     DNS Forwarding Server v%s                        ║\n",
+           DNS_SERVER_VERSION_STRING);
+    printf("║     Security Hardened Edition                            ║\n");
+    printf("╚══════════════════════════════════════════════════════════╝\n");
+    printf("\n");
+
+    /* Setup signal handlers */
+    setup_signal_handlers();
+
+    /* Parse command line arguments */
+    server_config_t config;
+    if (parse_args(argc, argv, &config) < 0) {
         return 1;
     }
-    
-    // Parse resolver address
-    char resolver_ip[16];
-    int resolver_port = 53;
-    
-    char *colon = strchr(argv[2], ':');
-    if (colon) {
-        int ip_len = colon - argv[2];
-        strncpy(resolver_ip, argv[2], ip_len);
-        resolver_ip[ip_len] = '\0';
-        resolver_port = atoi(colon + 1);
-    } else {
-        strcpy(resolver_ip, argv[2]);
-    }
-    
-    printf("Using resolver at %s:%d\n", resolver_ip, resolver_port);
-    
-    // Create UDP socket
-    int server_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (server_sock < 0) {
-        perror("Failed to create socket");
+
+    /* Initialize server */
+    dns_server_t server;
+    if (server_init(&server, &config, &g_running) < 0) {
         return 1;
     }
-    
-    // Set socket options for reuse
-    int enable = 1;
-    if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) < 0) {
-        perror("setsockopt(SO_REUSEADDR) failed");
-        close(server_sock);
-        return 1;
-    }
-    
-    // Bind socket to port 2053
-    struct sockaddr_in server_addr = {0};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(2053);
-    
-    if (bind(server_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Bind failed");
-        close(server_sock);
-        return 1;
-    }
-    
-    // Configure resolver address
-    struct sockaddr_in resolver_addr = {0};
-    resolver_addr.sin_family = AF_INET;
-    resolver_addr.sin_port = htons(resolver_port);
-    if (inet_pton(AF_INET, resolver_ip, &resolver_addr.sin_addr) <= 0) {
-        perror("Invalid resolver address");
-        close(server_sock);
-        return 1;
-    }
-    
-    // Main server loop
-    while (1) {
-        // Receive client query
-        unsigned char buffer[512];
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        
-        int recv_len = recvfrom(server_sock, buffer, sizeof(buffer), 0, 
-                               (struct sockaddr*)&client_addr, &client_len);
-        
-        if (recv_len < 0) {
-            perror("recvfrom failed");
-            continue;
-        }
-        
-        printf("Received %d bytes\n", recv_len);
-        
-        // Validate minimal DNS packet length
-        if (recv_len < (int)sizeof(dns_header_t)) {
-            printf("Packet too small to be a DNS query\n");
-            continue;
-        }
-        
-        // Parse DNS header
-        dns_header_t *header = (dns_header_t*)buffer;
-        uint16_t query_id = ntohs(header->id);
-        uint16_t qdcount = ntohs(header->qdcount);
-        uint16_t flags = ntohs(header->flags);
-        uint8_t rd = (flags >> 8) & 0x1;    // Recursion Desired
-        uint8_t opcode = (flags >> 11) & 0xF; // OPCODE
-        
-        printf("Received DNS query with ID: %d, OPCODE: %d, RD: %d, QDCOUNT: %d\n", 
-               query_id, opcode, rd, qdcount);
-        
-        // Single question case - forward directly
-        if (qdcount == 1) {
-            unsigned char response[512];
-            int response_len = 0;
-            
-            // Create resolver socket
-            int resolver_sock = socket(AF_INET, SOCK_DGRAM, 0);
-            if (resolver_sock < 0) {
-                perror("Failed to create resolver socket");
-                continue;
-            }
-            
-            // Set timeout for resolver using struct timeval
-            struct timeval tv;
-            tv.tv_sec = 5;
-            tv.tv_usec = 0;
-            
-            if (setsockopt(resolver_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-                perror("setsockopt failed");
-                close(resolver_sock);
-                continue;
-            }
-            
-            // Forward query and get response
-            response_len = forward_query(resolver_sock, &resolver_addr, 
-                                       buffer, recv_len, 
-                                       response, sizeof(response));
-            
-            close(resolver_sock);
-            
-            if (response_len > 0) {
-                printf("Received %d bytes from resolver\n", response_len);
-                
-                // Forward response to client
-                if (sendto(server_sock, response, response_len, 0, 
-                          (struct sockaddr*)&client_addr, client_len) < 0) {
-                    perror("Failed to send to client");
-                } else {
-                    printf("Forwarded response to client\n");
-                }
-            } else {
-                printf("Failed to get response from resolver\n");
-            }
-        } 
-        // Multiple questions case
-        else if (qdcount > 1) {
-            // Create response buffer
-            unsigned char response[512];
-            unsigned char *response_ptr = response + sizeof(dns_header_t);
-            
-            // Set up response header
-            dns_header_t *resp_header = (dns_header_t*)response;
-            resp_header->id = htons(query_id);
-            resp_header->flags = htons(0x8180); // Standard response, RD and RA set
-            resp_header->qdcount = htons(qdcount);
-            resp_header->ancount = htons(qdcount); // Same number of answers as questions
-            resp_header->nscount = htons(0);
-            resp_header->arcount = htons(0);
-            
-            // Extract and copy questions
-            unsigned char *q_ptr = buffer + sizeof(dns_header_t);
-            
-            // Process each question
-            for (int i = 0; i < qdcount; i++) {
-                // Extract the question
-                unsigned char question_buffer[256];
-                int question_len = 0;
-                
-                extract_question(question_buffer, q_ptr, &question_len);
-                
-                // Move to next question in original query
-                q_ptr += question_len;
-                
-                // Copy this question to the response
-                memcpy(response_ptr, question_buffer, question_len);
-                response_ptr += question_len;
-            }
-            
-            // Add answers for each question
-            q_ptr = buffer + sizeof(dns_header_t); // Reset to first question
-            
-            for (int i = 0; i < qdcount; i++) {
-                // Get the name and length for this question
-                int name_len = get_name_length(q_ptr);
-                
-                // Create an A record answer
-                char ip_addr[16];
-                sprintf(ip_addr, "8.8.8.%d", i + 1); // Different IP for each answer
-                
-                int answer_len = 0;
-                create_a_record_answer(response_ptr, q_ptr, name_len, ip_addr, &answer_len);
-                response_ptr += answer_len;
-                
-                // Move to next question
-                q_ptr += name_len + 4; // Skip TYPE and CLASS
-            }
-            
-            // Calculate total response length
-            int response_len = response_ptr - response;
-            
-            // Send response to client
-            if (sendto(server_sock, response, response_len, 0, 
-                      (struct sockaddr*)&client_addr, client_len) < 0) {
-                perror("Failed to send to client");
-            } else {
-                printf("Sent response for multi-question query (%d bytes)\n", response_len);
-            }
-        }
-    }
-    
-    close(server_sock);
-    return 0;
+
+    /* Run server */
+    int result = server_run(&server);
+
+    /* Print statistics on shutdown */
+    server_print_stats(&server);
+
+    /* Cleanup */
+    printf("\nShutting down gracefully...\n");
+    server_shutdown(&server);
+    printf("Server stopped.\n");
+
+    return result;
 }

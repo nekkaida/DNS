@@ -99,3 +99,6 @@ coverage/
 # Custom backups
 *-backup
 *.bak
+
+# Claude Code settings (user-specific)
+.claude/
